@@ -1,0 +1,141 @@
+# Upstream-drift watcher.
+#
+# This fork (ricardoavilajr/heisenberg-ssc-health-check) is consumed by
+# Moria (Saronic-Internal-Apps/moria) via a pinned SHA. If upstream
+# AppOmni-Labs/heisenberg-ssc-health-check ships fixes — particularly
+# security fixes — we want to know without manually polling.
+#
+# Cadence: 1st of each month at 12:00 UTC, plus on-demand via
+# workflow_dispatch.
+#
+# Behavior:
+#   1. Add upstream as a remote, fetch it.
+#   2. Compute the commit list `origin/main..upstream/main`.
+#   3. If non-empty, open (or update) a single tracking issue tagged
+#      `upstream-drift` with the commit list + a summary. If empty,
+#      do nothing.
+#
+# We deliberately do NOT auto-merge upstream. The whole point of the
+# fork is that we control what lands. The issue is the human-in-the-
+# loop signal that says "review this".
+
+name: upstream-watch
+
+on:
+  schedule:
+    # 12:00 UTC on the 1st of each month
+    - cron: "0 12 1 * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream-watch
+  cancel-in-progress: false
+
+jobs:
+  check-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork (full history)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Add upstream + fetch
+        run: |
+          git remote add upstream https://github.com/AppOmni-Labs/heisenberg-ssc-health-check.git
+          git fetch --quiet upstream
+
+      - name: Compute drift
+        id: drift
+        run: |
+          # Default branch name on upstream — usually main, sometimes master
+          UPSTREAM_BRANCH=$(git symbolic-ref refs/remotes/upstream/HEAD 2>/dev/null | sed 's@^refs/remotes/upstream/@@')
+          UPSTREAM_BRANCH=${UPSTREAM_BRANCH:-main}
+          echo "upstream_branch=$UPSTREAM_BRANCH" >> "$GITHUB_OUTPUT"
+
+          # Commits in upstream/<branch> NOT in HEAD
+          COMMITS=$(git log --oneline HEAD..upstream/$UPSTREAM_BRANCH || true)
+          COUNT=$(echo "$COMMITS" | grep -c . || echo 0)
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+          echo "::group::Drift summary (count=$COUNT)"
+          echo "$COMMITS"
+          echo "::endgroup::"
+
+          # Encode the commit list for downstream usage; truncate to
+          # keep the issue body under GitHub's limit.
+          {
+            echo 'commits<<COMMITS_EOF'
+            echo "$COMMITS" | head -100
+            echo 'COMMITS_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open or update tracking issue
+        if: steps.drift.outputs.count != '0'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
+        with:
+          script: |
+            const count = '${{ steps.drift.outputs.count }}';
+            const upstreamBranch = '${{ steps.drift.outputs.upstream_branch }}';
+            const commits = `${{ steps.drift.outputs.commits }}`;
+
+            // Look for an existing open issue we can update
+            const { data: issues } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              labels: 'upstream-drift',
+              per_page: 5,
+            });
+
+            const title = `[upstream-watch] ${count} new commit(s) upstream on ${upstreamBranch}`;
+            const body = [
+              `Automated upstream-drift check found **${count}** commit(s) on`,
+              `\`AppOmni-Labs/heisenberg-ssc-health-check@${upstreamBranch}\` that are not yet in this fork.`,
+              ``,
+              `**Run:** ${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`,
+              ``,
+              `**Commit list** (oldest first, max 100):`,
+              ``,
+              '```',
+              commits.trim(),
+              '```',
+              ``,
+              `## Triage checklist`,
+              ``,
+              `- [ ] Read the upstream diff: \`git fetch upstream && git log HEAD..upstream/${upstreamBranch}\``,
+              `- [ ] Identify any security-relevant fixes`,
+              `- [ ] Merge / cherry-pick what we want, leave the rest`,
+              `- [ ] If we adopt new code, bump the pinned SHA in moria/heisenberg_wrapper.py (\`heisenberg_pinned_sha\` in moria/config.py)`,
+              `- [ ] Close this issue with a comment noting which commits were adopted`,
+              ``,
+              `_This issue is auto-managed by the \`upstream-watch.yml\` workflow. Closing it is the all-clear signal._`,
+            ].join('\n');
+
+            if (issues.length > 0) {
+              const existing = issues[0];
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: existing.number,
+                title,
+                body,
+              });
+              core.info(`Updated existing issue #${existing.number}`);
+            } else {
+              const { data: created } = await github.rest.issues.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                body,
+                labels: ['upstream-drift'],
+              });
+              core.info(`Created issue #${created.number}`);
+            }
+
+      - name: No drift
+        if: steps.drift.outputs.count == '0'
+        run: echo "Fork is up to date with upstream — no action needed."
