@@ -59,7 +59,14 @@ jobs:
 
           # Commits in upstream/<branch> NOT in HEAD
           COMMITS=$(git log --oneline HEAD..upstream/$UPSTREAM_BRANCH || true)
-          COUNT=$(echo "$COMMITS" | grep -c . || echo 0)
+          # grep -c exits 1 on zero matches which `set -e` would propagate.
+          # Use wc -l which is always exit-0, then guard the empty case so
+          # an empty COMMITS doesn't produce a wc count of 1 (one empty line).
+          if [ -z "$COMMITS" ]; then
+            COUNT=0
+          else
+            COUNT=$(printf '%s\n' "$COMMITS" | wc -l | tr -d ' ')
+          fi
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
           echo "::group::Drift summary (count=$COUNT)"
           echo "$COMMITS"
